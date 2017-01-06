@@ -21,13 +21,20 @@ from .exceptions import (
     ContextDecodingException,
     FailedHookException,
     OutputDirExistsException,
-    UndefinedVariableInTemplate
+    UndefinedVariableInTemplate,
+    OutputFileExistsException,
 )
 from .find import find_template
 from .hooks import run_hook
 from .utils import make_sure_path_exists, work_in, rmtree
 
 logger = logging.getLogger(__name__)
+
+
+class ExistsAction(object):
+    LEAVE = 'exists'
+    OVERWRITE = 'overwrite'
+    ERROR = 'error'
 
 
 def is_copy_only_path(path, context):
@@ -114,7 +121,8 @@ def generate_context(context_file='cookiecutter.json', default_context=None,
     return context
 
 
-def generate_file(project_dir, infile, context, env):
+def generate_file(project_dir, infile, context, env,
+        overwrite_if_exists=False):
     """Render filename of infile as name of outfile, handle infile correctly.
 
     Dealing with infile appropriately:
@@ -141,6 +149,10 @@ def generate_file(project_dir, infile, context, env):
     outfile_tmpl = env.from_string(infile)
 
     outfile = os.path.join(project_dir, outfile_tmpl.render(**context))
+
+    if not overwrite_if_exists and os.path.isfile(outfile):
+        raise OutputFileExistsException(outfile)
+
     file_name_is_empty = os.path.isdir(outfile)
     if file_name_is_empty:
         logger.debug('The resulting file name is empty: {0}'.format(outfile))
@@ -181,7 +193,7 @@ def generate_file(project_dir, infile, context, env):
 
 
 def render_and_create_dir(dirname, context, output_dir, environment,
-                          overwrite_if_exists=False):
+                          exists_action):
     """Render name of a directory, create the directory, return its path."""
     name_tmpl = environment.from_string(dirname)
     rendered_dirname = name_tmpl.render(**context)
@@ -197,19 +209,23 @@ def render_and_create_dir(dirname, context, output_dir, environment,
 
     output_dir_exists = os.path.exists(dir_to_create)
 
-    if output_dir_exists:
-        if overwrite_if_exists:
+    if exists_action == ExistsAction.OVERWRITE:
+        if output_dir_exists:
             logger.debug(
                 'Output directory {} already exists,'
                 'overwriting it'.format(dir_to_create)
             )
-        else:
+    elif exists_action == ExistsAction.LEAVE:
+        pass
+    elif exists_action == ExistsAction.ERROR:
+        if output_dir_exists:
             msg = 'Error: "{}" directory already exists'.format(dir_to_create)
             raise OutputDirExistsException(msg)
     else:
-        make_sure_path_exists(dir_to_create)
+        raise ValueError(exists_action)
 
-    return dir_to_create, not output_dir_exists
+    make_sure_path_exists(dir_to_create)
+    return dir_to_create
 
 
 def ensure_dir_is_templated(dirname):
@@ -258,19 +274,32 @@ def generate_files(repo_dir, context=None, output_dir='.',
     logger.debug('Generating project from {}...'.format(template_dir))
     context = context or OrderedDict([])
 
-    unrendered_dir = os.path.split(template_dir)[1]
-    ensure_dir_is_templated(unrendered_dir)
+    try:
+        target_dir = context['cookiecutter']['_target']
+    except KeyError:
+        target_dir = None
+
     env = StrictEnvironment(
         context=context,
         keep_trailing_newline=True,
     )
+    unrendered_dir = os.path.split(template_dir)[1]
+    ensure_dir_is_templated(unrendered_dir)
+
+    if target_dir:
+        exists_action = ExistsAction.LEAVE
+    elif overwrite_if_exists:
+        exists_action = ExistsAction.OVERWRITE
+    else:
+        exists_action = ExistsAction.ERROR
+
     try:
         project_dir, output_directory_created = render_and_create_dir(
-            unrendered_dir,
+            target_dir if target_dir is not None else unrendered_dir,
             context,
             output_dir,
             env,
-            overwrite_if_exists
+            exists_action,
         )
     except UndefinedError as err:
         msg = "Unable to create project directory '{}'".format(unrendered_dir)
@@ -338,7 +367,7 @@ def generate_files(repo_dir, context=None, output_dir='.',
                         context,
                         output_dir,
                         env,
-                        overwrite_if_exists
+                        exists_action,
                     )
                 except UndefinedError as err:
                     if delete_project_on_failure:
@@ -357,13 +386,18 @@ def generate_files(repo_dir, context=None, output_dir='.',
                         'Copying file {} to {} without rendering'
                         ''.format(infile, outfile)
                     )
-                    shutil.copyfile(infile, outfile)
-                    shutil.copymode(infile, outfile)
+
+                    if os.path.exists(outfile):
+                        raise OutputFileExistsException(outfile)
+                    else:
+                        shutil.copyfile(infile, outfile)
+                        shutil.copymode(infile, outfile)
                     continue
                 try:
-                    generate_file(project_dir, infile, context, env)
+                    generate_file(project_dir, infile, context, env, overwrite_if_exists)
                 except UndefinedError as err:
-                    if delete_project_on_failure:
+                    # Don't delete pre-existing directories
+                    if not target_dir and delete_project_on_failure:
                         rmtree(project_dir)
                     msg = "Unable to create file '{}'".format(infile)
                     raise UndefinedVariableInTemplate(msg, err, context)
